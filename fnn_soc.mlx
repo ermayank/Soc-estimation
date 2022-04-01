@@ -1,0 +1,298 @@
+clc;
+close all;
+clearvars;
+fclose all;
+filename ="LG_HG2_Prepared_Dataset_McMasterUniversity_Jan_2020\LGHG2@n10C_to_25degC.zip"; % Add the Dataset File name
+outputFolder = fullfile(tempdir,"LGHG2@n10C_to_25degC");% The temporary location and name where the training data unzipped
+unzip(filename,outputFolder); 
+mkdir("Data folder")
+
+NET_Path="Data folder";
+%slect the Datafolder created in the next popup window to allow storing the
+%the data each iteration
+NET_Path=uigetdir('','Select folder to store data from each training iteration'); 
+folderTrain = fullfile(outputFolder,"Train");
+fdsPredictorTrain = fileDatastore(folderTrain, ...
+    'ReadFcn',@load, ...
+    'IncludeSubfolders',true);  %Is a datastore, for the training dataset, which is a repository for collections of data that are too large to fit in memory. 
+
+folderTest = fullfile(outputFolder,"Test");
+fdsPredictorTest = fileDatastore(folderTest, ...
+    'ReadFcn',@load, ...
+    'IncludeSubfolders',true); % Is a datastore, for the Testing dataset, which is a repository for collections of data that are too large to fit in memory 
+
+preview(fdsPredictorTrain)
+preview(fdsPredictorTest)
+
+folderYTrain = fullfile(outputFolder,"Train");
+fdsObjectiveTrain = fileDatastore(folderYTrain, ...
+    'ReadFcn',@load, ...
+    'IncludeSubfolders',true);% Is a datastore for the objective function, in this case SOC reference data for the training dataset. 
+
+folderYTest = fullfile(outputFolder,"Test");
+fdsObjectiveTest = fileDatastore(folderYTest, ...
+    'ReadFcn',@load, ...
+    'IncludeSubfolders',true);% Is a datastore for the objective function, in this case SOC reference data for the testing dataset. 
+
+% preview(fdsObjectiveTrain);
+% preview(fdsObjectiveTest);
+%Transform and Combine Data set
+RR=readall(fdsPredictorTrain);    % read all training data files
+numObservations = numel(RR);
+for i=1:numObservations
+    sequence = RR{i};  %combine training data set files into one structure. 
+    sequenceLengths(i) = size(sequence.X,2);
+end
+NumberOfMinibatches = 1; % If the dataset doesn't fit the memmory it'e necessary to increase the number of MiniBatches. Need to be a integer number 1 or >1.
+miniBatchSize = round(numObservations/NumberOfMinibatches) % Size of Mini-batches 
+
+%Max length of the training dataset files if the files are not in the same length, this will determine the amount of padding on the shorter files. If all files have the same lenght, there will be no padding .
+sequenceLength = max(sequenceLengths)
+
+RRTest=readall(fdsPredictorTest);
+numObservationsTest = numel(RRTest);
+fdsObjectiveTrain = transform(fdsObjectiveTrain,@(data) padSequenceY(data,sequenceLength)); % Padding function - Objective function Training Dataset
+fdsObjectiveTest = transform(fdsObjectiveTest,@(data) padSequenceY(data,sequenceLengthY)); % Padding function - Objective function Testing Dataset
+ObjectiveTest=readall(fdsObjectiveTest); %Objective function Test dataset, this is only to help manipulate the dataset for ploting and calculate the Errors.
+
+tdsTrain = transform(fdsPredictorTrain,@(data) padSequence(data,sequenceLength)); % Padding function - Training Dataset
+tdsTest = transform(fdsPredictorTest,@(data) padSequence(data,sequenceLengthY));  % Padding function - Testing Dataset
+preview(tdsTrain);
+PredictorTest=readall(tdsTest);%Predictors test dataset 
+cdsTrain = combine(tdsTrain,fdsObjectiveTrain);
+cdsTest = combine(tdsTest,fdsObjectiveTest);
+preview(cdsTrain)
+
+V=1; % Selection of the Validation dataset, in this script the validation dataset is the same as Test dataset, but it can be changed 
+X=PredictorTest{V}; %X predictors Validation dataset 
+Y=ObjectiveTest{V}; % Objective function "Y == SOC" for the Validation dataset
+numResponses = 1;
+%Number of inputs features (V, I, Temp, V_avg, I_avg)
+numFeatures = 5; 
+numHiddenUnits = 55; 
+Epochs  =  50; 
+LearnRateDropPeriod = 1000; 
+InitialLearnRate=0.01;
+LearnRateDropFactor=0.1; 
+validationFrequency = 10;  
+repeat=3;
+%FNN Structure
+layers = [sequenceInputLayer(numFeatures,"Normalization","zerocenter")
+    fullyConnectedLayer(numHiddenUnits)
+    tanhLayer                            % Hyperbolic Tangent
+    fullyConnectedLayer(numHiddenUnits)
+    leakyReluLayer(0.3)                  % The leaky rectified linear unit (ReLU) activation operation performs a nonlinear threshold operation, where any input value less than zero is multiplied by a fixed scale factor
+    fullyConnectedLayer(numResponses)
+    clippedReluLayer(1)                  % A clipped ReLU layer performs a threshold operation, where any input value less than zero is set to zero and any value above the clipping ceiling, this case '1', is set to that clipping ceiling.
+    regressionLayer];
+
+options = trainingOptions('adam', ...                    % Adam optimizer
+    'MaxEpochs',Epochs,'ExecutionEnvironment','cpu', ...% Select GPU if you works on computer with GPU
+    'GradientThreshold',1, ...
+    'InitialLearnRate',InitialLearnRate, ...
+    'LearnRateSchedule','piecewise', ...
+    'LearnRateDropPeriod',LearnRateDropPeriod, ...
+    'LearnRateDropFactor',LearnRateDropFactor, ...
+    'L2Regularization',1, ...
+    'ValidationData', {X,Y}, ...
+    'Shuffle','never',...
+    "Verbose",1,...
+    'ValidationFrequency',validationFrequency, ...
+    'MiniBatchSize',miniBatchSize, ...
+    'Plots','training-progress',...
+    'CheckpointPath', NET_Path); % to save each trained model during the training process, if necessary it can be "commented-out" and will only the last model will be available to be save.
+
+	for i=1:repeat
+    net = trainNetwork(cdsTrain,layers,options);
+
+    %Testing the Network
+    N=50; % To remove the first 'N' and last 'NN' datapoints to compensate the lack of previous data, which wouldn't normally occur in a real life xEV application
+    NN=50;
+    
+    YT=readall(fdsObjectiveTest);
+    XT=readall(fdsPredictorTest);
+    X_T=[];Y_Test=[];X_Test=[];Y_T=[];
+    Error_Test=[];
+    Nets{i} = net;% save the last trained model at the end of each repeat
+    Y_Pred_n10degC = predict(net,XT{1, 1}.X,'MiniBatchSize',miniBatchSize);
+    Y_Pred_0degC = predict(net,XT{2, 1}.X,'MiniBatchSize',miniBatchSize);
+    Y_Pred_10degC = predict(net,XT{3, 1}.X,'MiniBatchSize',miniBatchSize);
+    Y_Pred_25degC = predict(net,XT{4, 1}.X,'MiniBatchSize',miniBatchSize);
+    
+    Error_Test_n10degC = Y_Pred_n10degC(:,N:end-NN)-XT{1, 1}.Y(:,N:end-NN);
+    Error_Test_0degC = Y_Pred_0degC(:,N:end-NN)-XT{2, 1}.Y(:,N:end-NN);
+    Error_Test_10degC = Y_Pred_10degC(:,N:end-NN)-XT{3, 1}.Y(:,N:end-NN);
+    Error_Test_25degC = Y_Pred_25degC(:,N:end-NN)-XT{4, 1}.Y(:,N:end-NN);
+    
+    E_Test_RMSE_n10degC{i} = sqrt(mean((Error_Test_n10degC).^2))*100; %SOC Test dataset root mean square error
+    E_Test_MAE_n10degC{i} = mae(Error_Test_n10degC)*100; %SOC Test dataset Mean abs error 
+    E_Test_MAX_n10degC{i} = max(abs(Error_Test_n10degC)*100); %max SOC error of Test dataset
+    
+    E_Test_RMSE_10degC{i} = sqrt(mean((Error_Test_10degC).^2))*100; %SOC Test dataset root mean square error
+    E_Test_MAE_10degC{i} = mae(Error_Test_10degC)*100; %SOC Test dataset Mean abs error 
+    E_Test_MAX_10degC{i} = max(abs(Error_Test_10degC)*100); %max SOC error of Test dataset
+    
+    E_Test_RMSE_0degC{i} = sqrt(mean((Error_Test_0degC).^2))*100; %SOC Test dataset root mean square error
+    E_Test_MAE_0degC{i} = mae(Error_Test_0degC)*100; %SOC Test dataset Mean abs error 
+    E_Test_MAX_0degC{i} = max(abs(Error_Test_0degC)*100); %max SOC error of Test dataset
+    
+    E_Test_RMSE_25degC{i} = sqrt(mean((Error_Test_25degC).^2))*100; %SOC Test dataset root mean square error
+    E_Test_MAE_25degC{i} = mae(Error_Test_25degC)*100; %SOC Test dataset Mean abs error 
+    E_Test_MAX_25degC{i} = max(abs(Error_Test_25degC)*100); %max SOC error of Test dataset
+
+    end
+
+	RMSE_SUMMARY = ['-10degC_RMSE',E_Test_RMSE_n10degC;'0degC_RMSE',E_Test_RMSE_0degC;'10degC_RMSE',E_Test_RMSE_10degC;'25degC_RMSE',E_Test_RMSE_25degC];
+MAE_SUMMARY = ['-10degC_MAE',E_Test_MAE_n10degC;'0degC_MAE',E_Test_MAE_0degC;'10degC_MAE',E_Test_MAE_10degC;'25degC_MAE',E_Test_MAE_25degC];
+MAX_SUMMARY = ['-10degC_MAX',E_Test_MAX_n10degC;'0degC_MAX',E_Test_MAX_0degC;'10degC_MAX',E_Test_MAX_10degC;'25degC_MAX',E_Test_MAX_25degC];
+
+figure 
+bar(cell2mat(RMSE_SUMMARY(:,2:end)'),'DisplayName','RMSE Results')
+legend(["-10degC" "0degC" "10degC" "25degC"])
+ylabel("RMSE (%)")
+xlabel('# Repeats')
+title("Test - Estimation RMSE (%)")
+
+figure
+bar(cell2mat(MAE_SUMMARY(:,2:end)'),'DisplayName','MAE Results')
+legend(["-10degC" "0degC" "10degC" "25degC"])
+ylabel("MAE (%)")
+xlabel('# Repeats')
+title("Test - Estimation MAE (%)")
+
+figure
+bar(cell2mat(MAX_SUMMARY(:,2:end)'),'DisplayName','MAX Results')
+legend(["-10degC" "0degC" "10degC" "25degC"])
+ylabel("MAX (%)")
+xlabel('# Repeats')
+title("Test - Estimation MAX (%)")
+
+[Minimum_n10degC, idx] = min(cell2mat(E_Test_RMSE_n10degC));
+SelectNet =idx;
+
+Y_Pred_n10degC = predict(Nets{SelectNet},XT{1, 1}.X,'MiniBatchSize',miniBatchSize);
+Y_Pred_0degC = predict(Nets{SelectNet},XT{2, 1}.X,'MiniBatchSize',miniBatchSize);
+Y_Pred_10degC = predict(Nets{SelectNet},XT{3, 1}.X,'MiniBatchSize',miniBatchSize);
+Y_Pred_25degC = predict(Nets{SelectNet},XT{4, 1}.X,'MiniBatchSize',miniBatchSize);
+
+Error_Test_n10degC = Y_Pred_n10degC(:,N:end-NN)-XT{1, 1}.Y(:,N:end-NN);
+Error_Test_0degC = Y_Pred_0degC(:,N:end-NN)-XT{2, 1}.Y(:,N:end-NN);
+Error_Test_10degC = Y_Pred_10degC(:,N:end-NN)-XT{3, 1}.Y(:,N:end-NN);
+Error_Test_25degC = Y_Pred_25degC(:,N:end-NN)-XT{4, 1}.Y(:,N:end-NN);
+
+figure
+subplot(2,1,1)
+grid on
+hold all;
+plot(XT{1, 1}.Y(:,N:end-NN)*100,'LineWidth',3,'LineStyle','-'); 
+plot(Y_Pred_n10degC*100,'LineWidth',2,'LineStyle','-');
+
+legend(["Observed" "Predicted"])
+ylabel("(SOC)")
+xlabel('Time(s)')
+title("Test - SOC@-10degC - Estimation")
+grid on
+
+subplot(2,1,2)
+grid on
+hold all;
+plot((Error_Test_n10degC)*100,'LineWidth',2,'LineStyle','-'); 
+legend("Error")
+ylabel("(%)")
+xlabel('Time(s)')
+title("Error") 
+
+figure
+subplot(2,1,1)
+grid on
+hold all;
+plot(XT{2, 1}.Y(:,N:end-NN)*100,'LineWidth',3,'LineStyle','-'); 
+plot(Y_Pred_0degC*100,'LineWidth',2,'LineStyle','-');
+
+legend(["Observed" "Predicted"])
+ylabel("(SOC)")
+xlabel('Time(s)')
+title("Test - SOC@0degC - Estimation")
+grid on
+
+subplot(2,1,2)
+grid on
+hold all;
+plot((Error_Test_0degC)*100,'LineWidth',2,'LineStyle','-'); 
+legend("Error")
+ylabel("(%)")
+xlabel('Time(s)')
+title("Error")
+
+figure
+subplot(2,1,1)
+grid on
+hold all;
+plot(XT{3, 1}.Y(:,N:end-NN)*100,'LineWidth',3,'LineStyle','-'); 
+plot(Y_Pred_10degC*100,'LineWidth',2,'LineStyle','-');
+
+legend(["Observed" "Predicted"])
+ylabel("(SOC)")
+xlabel('Time(s)')
+title("Test - SOC@10degC - Estimation")
+grid on
+disp(mean(Y_Pred_10degC))
+
+subplot(2,1,2)
+grid on
+hold all;
+plot((Error_Test_10degC)*100,'LineWidth',2,'LineStyle','-'); 
+legend("Error")
+ylabel("(%)")
+xlabel('Time(s)')
+title("Error")  
+
+figure
+subplot(2,1,1)
+grid on
+hold all;
+plot(XT{4, 1}.Y(:,N:end-NN)*100,'LineWidth',3,'LineStyle','-'); 
+plot(Y_Pred_25degC*100,'LineWidth',2,'LineStyle','-');
+
+legend(["Observed" "Predicted"])
+ylabel("(SOC)")
+xlabel('Time(s)')
+title("Test - SOC@25degC - Estimation")
+grid on
+
+subplot(2,1,2)
+grid on
+hold all;
+plot((Error_Test_25degC)*100,'LineWidth',2,'LineStyle','-'); 
+legend("Error")
+ylabel("(%)")
+xlabel('Time(s)')
+title("Error") 
+
+function sequence = padSequence(data,sequenceLength)
+sequence = data.X;
+[C,S] = size(sequence);
+
+if S < sequenceLength
+    N=round((sequenceLength/S)*1);
+    Pad=repmat(sequence,1,N);  
+    padding = Pad(:,1:sequenceLength-S);
+    sequence = [sequence padding];
+else
+    sequence = sequence(:,1:sequenceLength);
+end
+sequence = {sequence};
+end
+function sequenceY = padSequenceY(data,sequenceLength)
+sequenceY = data.Y;
+[C,S] = size(sequenceY);
+if S < sequenceLength
+    N=round((sequenceLength/S)*1);
+    Pad=repmat(sequenceY,1,N);
+    padding = Pad(:,1:sequenceLength-S);
+    sequenceY = [sequenceY padding];
+else
+    sequenceY = sequenceY(:,1:sequenceLength);
+end
+sequenceY = {sequenceY};
+end
